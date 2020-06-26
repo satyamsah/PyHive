@@ -30,6 +30,10 @@ import thrift.protocol.TBinaryProtocol
 import thrift.transport.TSocket
 import thrift.transport.TTransport
 import thrift.transport.THttpClient
+from pyhive.signing import SignedRequestAuth
+import email.utils
+from pyhive.snap_thrift_http_client import SnapHttpClient
+
 
 # PEP 249 module globals
 apilevel = '2.0'
@@ -103,9 +107,10 @@ class TCookieHttpClient(thrift.transport.THttpClient.THttpClient):
     def flush(self):
         super(TCookieHttpClient, self).flush()
 
-        if self.headers['Set-Cookie'] is not None:
-            self.setCustomHeaders(
-                {'Cookie': self.headers['Set-Cookie']})
+        # if self.headers['Set-Cookie'] is not None:
+        #     print("INSIDE Set-Cookie")
+        #     self.setCustomHeaders(
+        #         {'Cookie': self.headers['Set-Cookie']})
 
 
 class Connection(object):
@@ -113,7 +118,7 @@ class Connection(object):
 
     def __init__(self, host=None, port=None, username=None, database='default', auth=None,
                  configuration=None, kerberos_service_name=None, password=None,
-                 thrift_transport=None, thrift_transport_protocol='binary', http_path=None):
+                 thrift_transport=None, thrift_transport_protocol='binary'):
         """Connect to HiveServer2
 
         :param host: What host HiveServer2 runs on
@@ -151,21 +156,20 @@ class Connection(object):
             self._transport = thrift_transport
         elif thrift_transport_protocol == 'binary':
             self._transport = Connection. \
-                create_binary_transport(host=host,
-                                        port=port,
+                __create_binary_transport(host=host,
+                                          username=username,
+                                          password=password,
+                                          kerberos_service_name=kerberos_service_name,
+                                          port=port,
+                                          auth=auth)
+        elif thrift_transport_protocol == 'http':
+            self._transport = Connection.\
+                __create_http_transport(host=host,
                                         username=username,
                                         password=password,
                                         kerberos_service_name=kerberos_service_name,
+                                        port=port,
                                         auth=auth)
-        elif thrift_transport_protocol == 'http':
-            self._transport = Connection.\
-                create_http_transport(host=host,
-                                      username=username,
-                                      port=port,
-                                      http_path=http_path,
-                                      password=password,
-                                      kerberos_service_name=kerberos_service_name,
-                                      auth=auth)
         else:
             raise ValueError("Invalid thrift_transport_protocol: {}".format(
                 thrift_transport_protocol))
@@ -197,16 +201,12 @@ class Connection(object):
             raise
 
     @staticmethod
-    def create_http_transport(host, port, http_path, username, password,
-                              kerberos_service_name, auth):
+    def __create_http_transport(host, username, password, kerberos_service_name,
+                                port, auth):
         if port is None:
             port = 10001
         if auth is None:
             auth = 'NONE'
-        if http_path is None:
-            http_path = '/'
-
-        socket = TCookieHttpClient('http://{}:{}{}'.format(host, port, http_path))
 
         if auth == 'KERBEROS':
             import kerberos
@@ -217,32 +217,53 @@ class Connection(object):
             kerberos.authGSSClientStep(krb_context, '')
             auth_header = kerberos.authGSSClientResponse(krb_context)
 
+            socket = TCookieHttpClient(uri_or_host=host,
+                                       port=port,
+                                       path='/')
+
             socket.setCustomHeaders(
                 {'Authorization': 'Negotiate {}'.format(auth_header)})
 
-        elif auth in ('BASIC', 'NOSASL', 'NONE'):
-            if auth == 'BASIC' and (username is None or password is None):
+        elif auth == 'BASIC':
+            if username is None or password is None:
                 raise ValueError("BASIC authentication require username and password.")
 
-            auth_credentials = '{}:{}'.format(username, password)\
+            socket = TCookieHttpClient(uri_or_host=host,
+                                       port=port,
+                                       path='/cliservice')
+            auth_credentials = '{}:{}'.format(username, password) \
                 .encode('UTF-8')
             auth_credentials_base64 = base64.standard_b64encode(
                 auth_credentials).decode('UTF-8')
-
-            # we're using the Authorization header for auth NONE or NOSASL because that's where
-            # Hive gets the username when doAs is enabled
             socket.setCustomHeaders(
                 {'Authorization': 'Basic {}'.format(auth_credentials_base64)})
 
+        elif auth == 'OCI_AUTH':
+            api_key = ("ocid1.tenancy.oc1.XZY/"
+                       + "ocid1.user.oc1..XZY/"
+                       + "XZY:XZY:XZY:XZY:XZY:XZY:XZY:XZY:XZY:XZY:XZY:XZY:XZY:XZY:XZY:XZY");
+            with open("/Users/kusatyam/.oci/oci_api_key.pem") as f:
+                private_key = f.read().strip()
+            auth_signer = SignedRequestAuth(api_key, private_key)
+
+            socket = SnapHttpClient(uri_or_host=host,
+                                       port=port,
+                                       path='/cliservice', auth_signer=auth_signer)
+
+        elif auth == 'NONE':
+            port = str(10001) + "/default"
+            socket = thrift.transport.THttpClient.THttpClient('http://{}:{}{}'.format(host, port, "/cliservice"))
+
         else:
             raise NotImplementedError(
-                "Only NONE, NOSASL, BASIC and KERBEROS authentication are supported "
+                "Only NONE, BASIC and KERBEROS authentication are supported "
                 "when using HTTP transport, got {}".format(auth))
 
         return thrift.transport.TTransport.TBufferedTransport(socket)
 
     @staticmethod
-    def create_binary_transport(host, port, username, password, kerberos_service_name, auth):
+    def __create_binary_transport(host, username, password,
+                                  kerberos_service_name, port, auth):
 
         if port is None:
             port = 10000
